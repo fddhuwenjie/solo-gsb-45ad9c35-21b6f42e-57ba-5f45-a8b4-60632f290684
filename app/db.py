@@ -17,13 +17,17 @@ CREATE TABLE IF NOT EXISTS exhibits (
     created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
--- 读数以 (exhibit_id, reading_id) 为主键，reading_id 即客户端幂等键
+-- 读数以 (exhibit_id, reading_id) 为主键，reading_id 即客户端幂等键。
+-- 批次更正只在 readings 行上置作废标记（软删除）：作废后读数立刻退出
+-- 剂量/诊断/列表口径，但行保留作为存证；voided_by 指向作废它的更正记录。
 CREATE TABLE IF NOT EXISTS readings (
-    exhibit_id  TEXT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
-    reading_id  TEXT NOT NULL,
-    ts          REAL NOT NULL,           -- 采样时刻，Unix 秒（UTC）
-    lux         REAL NOT NULL CHECK (lux >= 0),
-    received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    exhibit_id   TEXT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    reading_id   TEXT NOT NULL,
+    ts           REAL NOT NULL,           -- 采样时刻，Unix 秒（UTC）
+    lux          REAL NOT NULL CHECK (lux >= 0),
+    received_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    voided_at    TEXT,                    -- 作废时刻（UTC ISO）；NULL 表示读数仍生效
+    voided_by    TEXT,                    -- 作废它的 reading_corrections.request_key
     PRIMARY KEY (exhibit_id, reading_id)
 );
 
@@ -126,7 +130,36 @@ CREATE TABLE IF NOT EXISTS inventory_rounds (
     result_json    TEXT NOT NULL,          -- InventoryRoundOut 的 JSON（首次固化结果）
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- 照度上报批次更正：作废某张存证收据中实际插入的读数。
+-- 更正与读数作废标记在同一个 BEGIN IMMEDIATE 事务内落库；request_key 为
+-- 幂等键：相同 request_key 重放首次结果，改目标（规范档案/收据/原因）→ 409。
+-- 与 ingest_receipts 一样故意不设外键、不级联删除：归并删除档案后更正记录
+-- 连同收据链原样保留供事后核查；收据内容、序号与链哈希不受更正影响。
+-- (chain_id, seq) 上的部分唯一索引保证一张收据至多被成功更正一次。
+CREATE TABLE IF NOT EXISTS reading_corrections (
+    request_key       TEXT PRIMARY KEY,
+    canonical_id      TEXT NOT NULL,       -- 更正时解析出的规范档案 ID（= 收据链标识）
+    requested_id      TEXT NOT NULL,       -- 请求中使用的展品 ID（可能是别名）
+    receipt_id        TEXT NOT NULL,       -- 被更正的存证收据 receipt_id
+    chain_id          TEXT NOT NULL,       -- 被更正收据的链标识
+    seq               INTEGER NOT NULL,
+    reason            TEXT NOT NULL,       -- 作废原因
+    voided_count      INTEGER NOT NULL,    -- 实际作废读数条数
+    voided_json       TEXT NOT NULL,       -- 作废读数明细（id/ts/lux，按请求顺序去重）
+    result_json       TEXT NOT NULL,       -- ReadingCorrectionOut（首次结果，供重放）
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_corrections_receipt
+ON reading_corrections (chain_id, seq);
 """
+
+# 旧库（更正功能上线前创建）补列：幂等 ALTER，列已存在则跳过。
+_LEGACY_MIGRATIONS = (
+    "ALTER TABLE readings ADD COLUMN voided_at TEXT",
+    "ALTER TABLE readings ADD COLUMN voided_by TEXT",
+)
 
 
 def db_path() -> str:
@@ -147,6 +180,13 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        existing_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(readings)").fetchall()
+        }
+        for stmt in _LEGACY_MIGRATIONS:
+            col = stmt.split("ADD COLUMN", 1)[1].strip().split()[0]
+            if col not in existing_cols:
+                conn.execute(stmt)
 
 
 def get_conn() -> Iterator[sqlite3.Connection]:

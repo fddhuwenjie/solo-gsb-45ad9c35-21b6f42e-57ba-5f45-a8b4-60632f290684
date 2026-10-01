@@ -19,6 +19,7 @@ from .calendar import (
     open_intervals,
     save_calendar,
 )
+from .corrections import correct_receipt, voids_for_rows
 from .db import get_conn, init_db
 from .diagnose import build_events, intersect_window, sort_events
 from .dose import compute_dose
@@ -57,6 +58,8 @@ from .schemas import (
     MergePreviewOut,
     MergePreviewRequest,
     ReadingBatch,
+    ReadingCorrectionOut,
+    ReadingCorrectionRequest,
     ReadingListOut,
     ReadingOut,
     ReadingResult,
@@ -92,7 +95,7 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="馆藏展品光照剂量核算 API",
-    version="1.7.0",
+    version="1.8.0",
     description="登记展品光照上限，接收乱序/补传照度读数，按梯形法累计 lux·h，缺测段不插值；"
                 "支持展陈开放日历（IANA 时区 + 每周时段 + 日期例外），剂量可按开放时段裁剪核算；"
                 "支持重复展品档案预演归并，来源 ID 归并后成为目标 ID 的永久别名；"
@@ -100,6 +103,10 @@ app = FastAPI(
                 "支持 RFID 馆藏盘点对账（固定窗口内按区域保留最高 RSSI、以最后一个有事件窗口"
                 "定位、信号差不足阈值记为位置不明；轮次与规范化请求摘要绑定，重放原结果、"
                 "冲突请求 409、并发只固化一份结果；对账不改读数与收据链）；"
+                "支持照度上报批次更正：作废存证收据中实际插入且仍归属该档案的读数，"
+                "作废与更正记录在同一事务内幂等落库（request_key 重放原结果、换目标 409），"
+                "收据链/归并状态/读数归属变化整次 409；收据内容、序号与链哈希不变，"
+                "剂量/诊断/读数列表立即排除已作废读数；"
                 "支持展品应急撤离编排（有向通道图 + 整数通行秒数 + 并发容量 + 半开封闭时段，"
                 "按优先级降序/规范 ID 升序逐件做时变最早到达搜索，占用按 [进入,离开) 计数，"
                 "容量满或封闭时等待到首个可行时刻，同时刻按完整路径字典序决胜；"
@@ -372,7 +379,7 @@ def list_readings(
     """按时间顺序列出读数，便于核对与调试；别名自动解析到规范档案。"""
     exhibit = get_canonical_or_404(conn, exhibit_id)
     canonical_id = exhibit["id"]
-    sql = "SELECT * FROM readings WHERE exhibit_id = ?"
+    sql = ("SELECT * FROM readings WHERE exhibit_id = ? AND voided_at IS NULL")
     params: list = [canonical_id]
     if start is not None:
         sql += " AND ts >= ?"
@@ -396,7 +403,9 @@ def list_readings(
 
 # ---------- 照度上报存证（收据链查询与整链校验） ----------
 
-def receipt_out(row: sqlite3.Row) -> ReceiptOut:
+def receipt_out(row: sqlite3.Row,
+                void_map: dict[tuple[str, int], list[dict]] | None = None) -> ReceiptOut:
+    voids = (void_map or {}).get((row["chain_id"], row["seq"]), [])
     return ReceiptOut(
         chain_id=row["chain_id"],
         seq=row["seq"],
@@ -406,6 +415,7 @@ def receipt_out(row: sqlite3.Row) -> ReceiptOut:
         chain_hash=row["chain_hash"],
         created_at=row["created_at"],
         content=ReceiptContentOut(**json.loads(row["payload_json"])),
+        voids=voids,
     )
 
 
@@ -433,11 +443,12 @@ def list_receipts(
         "SELECT * FROM ingest_receipts WHERE chain_id = ? ORDER BY seq ASC LIMIT ?",
         (canonical_id, limit),
     ).fetchall()
+    void_map = voids_for_rows(conn, [(r["chain_id"], r["seq"]) for r in rows])
     return ReceiptListOut(
         requested_id=exhibit_id,
         canonical_id=canonical_id,
         chain_id=canonical_id,
-        receipts=[receipt_out(r) for r in rows],
+        receipts=[receipt_out(r, void_map) for r in rows],
     )
 
 
@@ -456,6 +467,28 @@ def verify_exhibit_receipt_chain(
     return _chain_verify_out(canonical_id, verify_chain_rows(load_chain(conn, canonical_id)))
 
 
+@app.post("/exhibits/{exhibit_id}/receipts/corrections",
+          response_model=ReadingCorrectionOut, tags=["receipts"])
+def void_ingest_batch(
+    exhibit_id: str,
+    payload: ReadingCorrectionRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> ReadingCorrectionOut:
+    """照度上报批次更正：作废某张存证收据中实际插入的读数。
+
+    - 请求 ID 可用归并别名（自动解析到规范档案）；服务只作废该收据中
+      ``inserted`` 且作废时**仍归属该规范档案、内容未变、尚未作废**的读数，
+      任一条不满足（收据链/归并状态/读数归属已变化、收据已被更正）整次 **409**，
+      不做部分作废；
+    - 作废标记与更正记录在**同一个 SQLite 事务**（BEGIN IMMEDIATE）内幂等落库；
+      ``request_key`` 为幂等键，同键重放首次结果（``already_committed=true``），
+      换目标（规范档案/收据/原因不同）→ 409；
+    - 收据内容、序号与链哈希**保持不变**（查询收据时在 ``voids`` 中标出作废）；
+      作废读数立即退出剂量查询、采集质量诊断与读数列表，并按剩余时间线重算。
+    """
+    return correct_receipt(conn, exhibit_id, payload)
+
+
 @app.get("/exhibits/{exhibit_id}/receipts/{seq}", response_model=ReceiptOut, tags=["receipts"])
 def get_receipt(
     exhibit_id: str,
@@ -470,7 +503,8 @@ def get_receipt(
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"收据不存在: {exhibit_id} 第 {seq} 张")
-    return receipt_out(row)
+    void_map = voids_for_rows(conn, [(row["chain_id"], row["seq"])])
+    return receipt_out(row, void_map)
 
 
 @app.get("/receipts/chains/{chain_id}", response_model=ChainReceiptsOut, tags=["receipts"])
@@ -490,7 +524,10 @@ def list_chain_receipts(
     ).fetchall()
     if not rows:
         raise HTTPException(status_code=404, detail=f"收据链不存在: {chain_id}")
-    return ChainReceiptsOut(chain_id=chain_id, receipts=[receipt_out(r) for r in rows])
+    void_map = voids_for_rows(conn, [(r["chain_id"], r["seq"]) for r in rows])
+    return ChainReceiptsOut(
+        chain_id=chain_id, receipts=[receipt_out(r, void_map) for r in rows]
+    )
 
 
 @app.get("/receipts/chains/{chain_id}/verify", response_model=ChainVerifyOut, tags=["receipts"])
@@ -538,9 +575,10 @@ def diagnose_readings(
     if end_s <= start_s:
         raise HTTPException(status_code=422, detail="end 必须晚于 start")
 
-    # 完整时间线：诊断事件必须在全部已存读数上形成，不能只取窗口内数据
+    # 完整时间线：诊断事件必须在全部已存（未作废）读数上形成，不能只取窗口内数据
     rows = conn.execute(
-        "SELECT reading_id, ts, lux FROM readings WHERE exhibit_id = ? ORDER BY ts, reading_id",
+        "SELECT reading_id, ts, lux FROM readings "
+        "WHERE exhibit_id = ? AND voided_at IS NULL ORDER BY ts, reading_id",
         (canonical_id,),
     ).fetchall()
     events = build_events(
@@ -622,11 +660,13 @@ def query_dose(
     # 2) end 之后最近一条读数——窗口末端可向其线性裁剪。
     # 窗口起点之前的历史读数本身就在 1) 中，窗口起点处同样可线性裁剪。
     all_rows = conn.execute(
-        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts <= ? ORDER BY ts ASC",
+        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts <= ? "
+        "AND voided_at IS NULL ORDER BY ts ASC",
         (canonical_id, end_s),
     ).fetchall()
     after = conn.execute(
-        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts > ? ORDER BY ts ASC LIMIT 1",
+        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts > ? "
+        "AND voided_at IS NULL ORDER BY ts ASC LIMIT 1",
         (canonical_id, end_s),
     ).fetchall()
     readings = [(r["ts"], r["lux"]) for r in all_rows]

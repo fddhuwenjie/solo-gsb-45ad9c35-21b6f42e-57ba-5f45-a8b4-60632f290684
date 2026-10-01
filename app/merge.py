@@ -54,8 +54,15 @@ def _meta_hash(row: sqlite3.Row) -> str:
 
 
 def _readings_hash(rows: list[sqlite3.Row]) -> str:
+    # 作废标记同样是读数集合版本的一部分：预演后发生批次更正（作废）也使令牌失效。
+    # 旧库迁移前列可能缺失，用 row.keys() 兜底。
+    cols = rows[0].keys() if rows else ()
     payload = [
-        (r["reading_id"], float.hex(r["ts"]), float.hex(r["lux"]))
+        (
+            r["reading_id"], float.hex(r["ts"]), float.hex(r["lux"]),
+            r["voided_at"] if "voided_at" in cols else None,
+            r["voided_by"] if "voided_by" in cols else None,
+        )
         for r in rows
     ]
     payload.sort()
@@ -364,19 +371,21 @@ def commit_merge(conn: sqlite3.Connection, token: str,
                 new_id = decision.new_id
                 assert new_id is not None
                 conn.execute(
-                    "INSERT INTO readings (exhibit_id, reading_id, ts, lux, received_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (target_id, new_id, s["ts"], s["lux"], s["received_at"]),
+                    "INSERT INTO readings (exhibit_id, reading_id, ts, lux, received_at, "
+                    "voided_at, voided_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (target_id, new_id, s["ts"], s["lux"], s["received_at"],
+                     s["voided_at"], s["voided_by"]),
                 )
                 applied.append(
                     MergeResolutionResult(reading_id=rid, action="rename_source", new_id=new_id)
                 )
                 continue
-            # 仅来源存在：整体搬迁，保留读数 ID 与原始接收时刻
+            # 仅来源存在：整体搬迁，保留读数 ID、原始接收时刻与作废标记
             conn.execute(
-                "INSERT INTO readings (exhibit_id, reading_id, ts, lux, received_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (target_id, rid, s["ts"], s["lux"], s["received_at"]),
+                "INSERT INTO readings (exhibit_id, reading_id, ts, lux, received_at, "
+                "voided_at, voided_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (target_id, rid, s["ts"], s["lux"], s["received_at"],
+                 s["voided_at"], s["voided_by"]),
             )
             moved += 1
 

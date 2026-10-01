@@ -96,6 +96,11 @@ class ReceiptOut(BaseModel):
     chain_hash: str = Field(description="SHA-256(prev_hash + content_hash)")
     created_at: str
     content: ReceiptContentOut
+    voids: list[ReceiptVoidOut] = Field(
+        default_factory=list,
+        description="该收据已完成的批次更正（作废标记）；更正不改写收据内容、序号与链哈希，"
+                    "故标记放在 content 之外。一张收据至多有一条成功更正",
+    )
 
 
 class ReceiptListOut(BaseModel):
@@ -137,6 +142,53 @@ class IngestResponse(BaseModel):
     conflicts: int
     results: list[ReadingResult]
     receipt: ReceiptOut = Field(description="本次上报的存证收据（与读数同一事务生成）")
+
+
+# ---------- 照度上报批次更正（作废） ----------
+
+class ReadingCorrectionRequest(BaseModel):
+    receipt_id: str = Field(min_length=1, max_length=200,
+                            description="被更正批次的存证收据 receipt_id（上报响应中返回）")
+    request_key: str = Field(min_length=1, max_length=200,
+                             description="更正幂等键：同键重放首次结果，换目标（收据/档案/原因）→ 409")
+    reason: str = Field(min_length=1, max_length=2000, description="作废原因")
+
+
+class VoidedReadingOut(BaseModel):
+    """一条被更正作废的读数（内容取自被更正收据记录的插入结果）。"""
+
+    id: str = Field(description="读数 ID")
+    ts: str = Field(description="采样时刻（UTC，ISO 8601，Z 结尾）")
+    lux: float = Field(description="作废时读数记录的照度（lux）")
+
+
+class ReceiptVoidOut(BaseModel):
+    """收据上的作废标记：查询收据时附在 content 之外（content 与哈希永不改变）。"""
+
+    request_key: str = Field(description="完成本次作废的更正 request_key")
+    reason: str = Field(description="作废原因")
+    voided_count: int = Field(description="该收据中被作废的读数条数")
+    voided_readings: list[VoidedReadingOut] = Field(description="被作废的读数明细（按首次更正请求顺序去重）")
+    voided_at: str = Field(description="作废时刻（UTC，ISO 8601，Z 结尾）")
+
+
+class ReadingCorrectionOut(BaseModel):
+    requested_id: str = Field(description="请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="解析后的规范档案 ID（即被更正收据的链标识）")
+    receipt_id: str = Field(description="被更正的存证收据 receipt_id")
+    chain_id: str = Field(description="被更正收据的链标识（写入时的规范档案 ID）")
+    seq: int = Field(description="被更正在其链内的序号")
+    request_key: str = Field(description="本次更正的幂等键")
+    reason: str
+    voided_count: int = Field(description="本次实际作废的读数条数")
+    voided_readings: list[VoidedReadingOut] = Field(
+        description="本次作废的读数：仅该收据实际插入、作废时仍归属该档案且内容未变的读数",
+    )
+    voided_at: str = Field(description="作废时刻（UTC，ISO 8601，Z 结尾）")
+    already_committed: bool = Field(
+        default=False,
+        description="false 表示本次首次落库；true 表示同一 request_key 重放，返回首次结果",
+    )
 
 
 class ReadingOut(BaseModel):

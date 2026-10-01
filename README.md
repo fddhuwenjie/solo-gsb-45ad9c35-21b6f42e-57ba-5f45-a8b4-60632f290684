@@ -37,6 +37,12 @@
   SHA-256 链哈希衔接上一张收据；并发上报形成唯一连续序号，失败事务不留
   收据；提供收据查询与整链校验，档案归并保留双方既有链、归并后新上报继续
   接入目标原链，旧哈希绝不重写。
+- 支持**照度上报批次更正（作废）**：提交规范档案（可用别名）、收据
+  `receipt_id`、`request_key` 与原因，只作废该收据中**实际插入**且仍归属
+  该档案的读数；收据链、归并状态或读数归属已变化则整次 **409**；作废与
+  更正记录在一个 SQLite 事务内幂等落库，重复 `request_key` 重放原结果、
+  换目标 409；剂量查询、采集质量诊断与读数列表立即排除已作废读数并按剩余
+  时间线重算，收据内容、序号与链哈希保持不变（查询收据时标出作废状态）。
 - 提供**可验证的 SQLite 在线快照**：`sqlite3.Connection.backup` 热备生成
   事务一致副本（临时文件 → SHA-256 + 清单 → 原子重命名发布），支持
   创建 / 列表 / 下载，并可在独立只读连接上核对哈希、执行
@@ -73,7 +79,8 @@ SQLite 数据文件存放在命名卷 `lightdose-data`（容器内 `/data/lightd
 | POST | `/exhibits/{id}/readings` | 批量上报读数（幂等，支持乱序/补传；同事务生成存证收据） |
 | GET | `/exhibits/{id}/readings` | 按时间顺序列出读数 |
 | GET | `/exhibits/{id}/receipts` | 列出存证收据链（按序号升序，别名自动解析） |
-| GET | `/exhibits/{id}/receipts/{seq}` | 查询单张存证收据 |
+| GET | `/exhibits/{id}/receipts/{seq}` | 查询单张存证收据（已作废批次在 `voids` 标出） |
+| POST | `/exhibits/{id}/receipts/corrections` | 照度上报批次更正：作废收据中实际插入的读数（幂等，request_key 重放/409） |
 | GET | `/exhibits/{id}/receipts/verify` | 整链校验规范档案的收据链 |
 | GET | `/receipts/chains/{chain_id}` | 按链标识直接读取收据链（不解析别名） |
 | GET | `/receipts/chains/{chain_id}/verify` | 按链标识整链校验（归并后来源链核查） |
@@ -136,7 +143,8 @@ curl -s -X POST http://localhost:8000/exhibits/<id>/readings \
 - 时间缺省时区按 **UTC** 处理。
 
 每次上报都会在写入读数的**同一事务**内生成一张存证收据（响应中的
-`receipt` 字段），详见下文「照度上报存证（收据链）」。
+`receipt` 字段），详见下文「照度上报存证（收据链）」。需要把整批读数
+作废时见「照度上报批次更正（作废）」。
 
 ### 3. 时段剂量查询
 
@@ -554,6 +562,132 @@ curl -s http://localhost:8000/exhibits/<id>/receipts/verify
 curl -s http://localhost:8000/receipts/chains/DUP-042/verify
 curl -s http://localhost:8000/receipts/chains/EX-042/verify
 ```
+
+## 照度上报批次更正（作废）
+
+传感器漂移、接线错误等情况下，可用批次更正把某张存证收据中**实际插入**的
+读数整批作废。作废是**软删除**：读数行保留（仍可在数据库中核查），但立即退出
+剂量核算、采集质量诊断与读数列表口径；收据本身**只增不改**，其内容、序号与
+链哈希全部保持不变，作废状态在查询收据时单独标出。
+
+### 12b. 提交一次批次更正
+
+```bash
+curl -s -X POST http://localhost:8000/exhibits/<id>/receipts/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "receipt_id": "9c4f1a2b…",
+    "request_key": "fix-2026-09-21-shift-A",
+    "reason": "A 组传感器 09:00–11:00 漂移，该批次读数作废"
+  }'
+```
+
+请求字段：
+
+| 字段 | 含义 |
+|---|---|
+| `receipt_id` | 被更正批次的存证收据 `receipt_id`（上报响应 `receipt.receipt_id`） |
+| `request_key` | 更正幂等键：同键重放首次结果；换目标（档案 / 收据 / 原因）→ 409 |
+| `reason` | 作废原因（必填） |
+
+路径中的展品 ID 可用规范 ID，也可用归并后的**别名**（自动解析到规范档案）。
+
+```json
+{
+  "requested_id": "...",
+  "canonical_id": "...",
+  "receipt_id": "9c4f1a2b…",
+  "chain_id": "...",
+  "seq": 3,
+  "request_key": "fix-2026-09-21-shift-A",
+  "reason": "A 组传感器 09:00–11:00 漂移，该批次读数作废",
+  "voided_count": 2,
+  "voided_readings": [
+    {"id": "r2", "ts": "2026-09-21T09:00:00Z", "lux": 180.0},
+    {"id": "r3", "ts": "2026-09-21T10:00:00Z", "lux": 190.0}
+  ],
+  "voided_at": "2026-09-21T12:00:00.000Z",
+  "already_committed": false
+}
+```
+
+- 只作废收据结果为 **`inserted`** 的读数；`duplicate` / `conflict` 的读数
+  本就未由该收据写入，不在作废范围内（同批次请求内重复出现的插入 ID 去重）；
+- 作废在写读数作废标记的**同一个 `BEGIN IMMEDIATE` 事务**内连同更正记录落库，
+  任一前置校验失败整体回滚，**不做部分作废**。
+
+### 12c. 前置状态变化：整次 409
+
+服务在事务内复核全部前置条件，任一不满足整次返回 **409** 且不产生任何作废：
+
+- **收据链变化**：收据不属于当前规范档案的链，或整链校验失败
+  （序号 / `prev_hash` / 内容哈希 / 链哈希被篡改）；
+- **归并状态变化**：例如档案已被归并，用来源别名更正**来源链**上的旧收据
+  ——来源链原样保留但读数已搬到目标档案，链标识与当前规范档案不一致；
+- **读数归属变化**：某条插入读数已不在该档案下（被归并去重 / 删除）、
+  内容已被归并裁决覆盖（`keep_source` 改名 / 改值）、或已被另一次更正作废；
+- 该收据此前已被**另一条更正**成功作废（一张收据至多成功更正一次）。
+
+不存在的展品或 `receipt_id` 返回 **404**。
+
+### 12d. 幂等重放与换目标冲突
+
+`request_key` 与（规范档案、收据、原因）三元组一一绑定，模式与盘点轮次一致：
+
+```bash
+# 相同 request_key + 相同目标重放 → 200，回放首次结果
+curl -s -X POST http://localhost:8000/exhibits/<id>/receipts/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"receipt_id":"9c4f…","request_key":"fix-2026-09-21-shift-A","reason":"同一原因"}'
+# {"...": "...", "already_committed": true, "voided_count": 2, "voided_at": "<首次时刻>"}
+
+# 同 request_key 换收据 / 改原因 / 指向另一档案 → 409
+# HTTP/1.1 409 Conflict
+# {"detail":"request_key fix-2026-09-21-shift-A 已绑定另一次更正（收据/档案/原因不同），不能换目标重复提交"}
+
+# 归并后用来源别名重放同一 request_key（解析到同一规范档案）→ 200 回放
+```
+
+并发提交同一张收据的不同 `request_key`：恰好一个成功（200），其余 409；
+并发提交相同 `request_key`：一份首次结果，竞争方全部回放
+（`already_committed=true`）。
+
+### 12e. 作废后的查询口径
+
+- **剂量查询** `GET /exhibits/{id}/dose`：已作废读数立即排除，按剩余时间线
+  实时重算——作废中间读数可能使相邻点间隔超过 `max_interval_seconds` 而产生
+  新的缺测段，剩余额度与首次越线时刻同样按剩余历史重算；
+- **采集质量诊断** `POST /exhibits/{id}/readings/diagnose`：在剩余读数的完整
+  时间线上重新形成 gap / jump / stuck / timestamp_conflict 事件；
+- **读数列表** `GET /exhibits/{id}/readings`：不再返回已作废读数；
+- **存证收据**：内容、序号、`prev_hash` / `content_hash` / `chain_hash`
+  全部不变，整链校验仍通过；查询收据（单张、档案链列表、按链标识直查）时
+  在 content 之外的 **`voids`** 字段标发作废状态：
+
+```json
+{
+  "chain_id": "...", "seq": 3, "receipt_id": "9c4f…",
+  "content_hash": "…", "chain_hash": "…",
+  "content": { "…": "（与作废前完全一致，哈希仍可复现）" },
+  "voids": [
+    {"request_key": "fix-2026-09-21-shift-A",
+     "reason": "A 组传感器 09:00–11:00 漂移，该批次读数作废",
+     "voided_count": 2,
+     "voided_readings": [
+       {"id": "r2", "ts": "2026-09-21T09:00:00Z", "lux": 180.0},
+       {"id": "r3", "ts": "2026-09-21T10:00:00Z", "lux": 190.0}],
+     "voided_at": "2026-09-21T12:00:00.000Z"}
+  ]
+}
+```
+
+未作废收据 `voids` 为空列表 `[]`。归并会把读数的作废标记随读数一起搬迁，
+更正记录与来源收据链一样原样保留，可通过
+`GET /receipts/chains/{chain_id}` 继续核查。
+
+> **读数 ID 复用**：作废是软删除，读数 ID 仍是该档案下的既有 ID。用同 ID
+> 同数据重新上报记为 `duplicate`（读数保持作废态，不会“复活”），同 ID
+> 不同数据记为 `conflict`；需要以新读数替换时请使用新的读数 ID。
 
 ## 核算语义
 
@@ -1028,14 +1162,16 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── inventory.py # RFID 盘点对账：固定窗口最高 RSSI 定位、信号差阈值判不明、四类差异、请求摘要绑定与并发固化
 │   ├── evacuation.py # 应急撤离编排：时变最早到达搜索、[进入,离开) 半开容量计数、封闭等待/绕行、路径字典序决胜（纯只读）
 │   ├── receipts.py  # 照度上报存证：收据规范序列化、SHA-256 链哈希、整链校验
+│   ├── corrections.py # 上报批次更正：作废收据中实际插入的读数、request_key 幂等、前置变化整次 409
 │   ├── snapshots.py # SQLite 在线快照：backup 热备、临时文件 + SHA-256 清单 + 原子重命名、只读校验
-│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds）
+│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections）
 │   └── schemas.py   # Pydantic 请求/响应模型
 ├── tests/
 │   ├── test_api.py       # 剂量核算与归并
 │   ├── test_diagnose.py  # 照度采集质量诊断
 │   ├── test_calendar.py  # 展陈开放日历
 │   ├── test_receipts.py  # 照度上报存证：收据链、整链校验、并发顺序、归并保留
+│   ├── test_corrections.py # 上报批次更正：仅作废 inserted、重放/换目标 409、链/归并/归属变化 409、查询排除
 │   ├── test_inventory.py # RFID 盘点对账：窗口定位、四类差异、别名解析、摘要重放/409、并发固化、隔离性
 │   ├── test_evacuation.py # 应急撤离：容量竞争、半开封闭等待/绕行、路径字典序平局、别名重复 422、无出口 422、只读隔离
 │   └── test_snapshots.py # 在线快照：事务一致副本、409 并发、原子发布、下载、只读校验与防篡改
