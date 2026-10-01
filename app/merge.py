@@ -9,6 +9,8 @@
   都会导致哈希不一致 → 409，事务回滚，不产生部分变更。
 - 同读数 ID 且时间、照度一致的碰撞自动去重；内容不同的碰撞必须逐条
   裁决（keep_target / keep_source / rename_source），未解决不得提交。
+  **已被批次更正作废的读数不参与归并**：不搬迁、不碰撞、不去重，
+  版本哈希也只覆盖有效读数；来源侧作废行随来源档案删除一并消失。
 - 提交成功后把结果固化在令牌行上，重复使用同一令牌回放原结果。
 - 归并不触碰照度上报存证收据链：来源与目标的既有链原样保留、提交前
   分别校验（断链或内容不符即 409 拒绝归并），归并后的新上报继续接入
@@ -62,6 +64,12 @@ def _readings_hash(rows: list[sqlite3.Row]) -> str:
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+
+
+_ACTIVE_READINGS = (
+    "SELECT * FROM readings WHERE exhibit_id = ? AND voided_at IS NULL "
+    "ORDER BY reading_id"
+)
 
 
 # ---------- 别名解析 ----------
@@ -131,12 +139,10 @@ def create_preview(conn: sqlite3.Connection, requested_source: str,
             detail=f"{requested_source} 与 {requested_target} 已指向同一档案 {source_id}，无需归并",
         )
 
-    src_rows = conn.execute(
-        "SELECT * FROM readings WHERE exhibit_id = ? ORDER BY reading_id", (source_id,)
-    ).fetchall()
-    tgt_rows = conn.execute(
-        "SELECT * FROM readings WHERE exhibit_id = ? ORDER BY reading_id", (target_id,)
-    ).fetchall()
+    # 已作废读数不参与归并（不搬迁、不碰撞、不去重）：作废是档案维度的存证动作，
+    # 来源侧作废行随来源档案删除一并消失，目标侧作废行继续保留在目标。
+    src_rows = conn.execute(_ACTIVE_READINGS, (source_id,)).fetchall()
+    tgt_rows = conn.execute(_ACTIVE_READINGS, (target_id,)).fetchall()
 
     src_map = {r["reading_id"]: r for r in src_rows}
     tgt_map = {r["reading_id"]: r for r in tgt_rows}
@@ -294,12 +300,8 @@ def commit_merge(conn: sqlite3.Connection, token: str,
         if src is None or tgt is None:
             raise _PreviewChanged("预演后来源或目标档案已被删除")
 
-        src_rows = conn.execute(
-            "SELECT * FROM readings WHERE exhibit_id = ?", (source_id,)
-        ).fetchall()
-        tgt_rows = conn.execute(
-            "SELECT * FROM readings WHERE exhibit_id = ?", (target_id,)
-        ).fetchall()
+        src_rows = conn.execute(_ACTIVE_READINGS, (source_id,)).fetchall()
+        tgt_rows = conn.execute(_ACTIVE_READINGS, (target_id,)).fetchall()
         if (
             _meta_hash(src) != preview["source_meta_hash"]
             or _meta_hash(tgt) != preview["target_meta_hash"]
@@ -399,7 +401,8 @@ def commit_merge(conn: sqlite3.Connection, token: str,
         conn.execute("DELETE FROM exhibits WHERE id = ?", (source_id,))
 
         final_count = conn.execute(
-            "SELECT COUNT(*) AS n FROM readings WHERE exhibit_id = ?", (target_id,)
+            "SELECT COUNT(*) AS n FROM readings WHERE exhibit_id = ? AND voided_at IS NULL",
+            (target_id,),
         ).fetchone()["n"]
         aliases = aliases_of(conn, target_id)
         # 双方既有收据链原样保留（归并不触碰收据表），列出链标识供分别核查

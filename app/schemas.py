@@ -87,6 +87,18 @@ class ReceiptContentOut(BaseModel):
     outcome: ReceiptOutcomeOut
 
 
+class ReceiptCorrectionOut(BaseModel):
+    """一张收据的批次更正（作废）记录；收据未被更正时 correction 为 null。"""
+
+    request_key: str = Field(description="作废方提交的幂等键")
+    canonical_id: str = Field(description="更正时读数归属的规范档案 ID")
+    reason: str = Field(description="作废原因")
+    voided_reading_ids: list[str] = Field(
+        description="实际作废的读数 ID（该收据中 inserted 且更正时仍归属该档案的读数），稳定排序",
+    )
+    created_at: str = Field(description="更正落库时刻（UTC，ISO 8601，Z 结尾）")
+
+
 class ReceiptOut(BaseModel):
     chain_id: str = Field(description="链标识：写入时的规范档案 ID")
     seq: int = Field(description="链内序号，从 1 连续递增")
@@ -96,6 +108,18 @@ class ReceiptOut(BaseModel):
     chain_hash: str = Field(description="SHA-256(prev_hash + content_hash)")
     created_at: str
     content: ReceiptContentOut
+    voided: bool = Field(
+        default=False,
+        description="该收据是否已被批次更正作废过（至少作废过一条读数）",
+    )
+    voided_reading_ids: list[str] = Field(
+        default_factory=list,
+        description="该收据已被作废的读数 ID；收据内容、序号与链哈希均不因此改变",
+    )
+    correction: ReceiptCorrectionOut | None = Field(
+        default=None,
+        description="作废该收据的更正记录；未更正时为 null",
+    )
 
 
 class ReceiptListOut(BaseModel):
@@ -137,6 +161,52 @@ class IngestResponse(BaseModel):
     conflicts: int
     results: list[ReadingResult]
     receipt: ReceiptOut = Field(description="本次上报的存证收据（与读数同一事务生成）")
+
+
+# ---------- 照度上报批次更正（作废） ----------
+
+class BatchCorrectionRequest(BaseModel):
+    """上报批次更正请求：作废指定收据中本档案实际插入的读数。"""
+
+    receipt_id: str = Field(
+        min_length=1, max_length=200,
+        description="存证收据 ID（content.receipt_id，非链内序号）",
+    )
+    request_key: str = Field(
+        min_length=1, max_length=200,
+        description="作废幂等键：同键重放原结果；换档案/收据/原因提交 → 409",
+    )
+    reason: str = Field(
+        min_length=1, max_length=1000,
+        description="作废原因（随更正记录存证，且是 request_key 绑定内容的一部分）",
+    )
+
+
+class BatchCorrectionOut(BaseModel):
+    """上报批次更正的首次结果（同 request_key 重放时回放本对象）。"""
+
+    requested_id: str = Field(description="请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="作废读数当前归属的规范档案 ID")
+    chain_id: str = Field(description="被作废收据的链标识（写入时的规范档案 ID）")
+    seq: int = Field(description="被作废收据的链内序号")
+    receipt_id: str = Field(description="被作废收据 ID")
+    request_key: str = Field(description="作废幂等键")
+    reason: str
+    voided_count: int = Field(description="实际作废的读数条数")
+    voided_reading_ids: list[str] = Field(
+        description="实际作废的读数 ID（稳定排序），立即从剂量/诊断/读数列表排除",
+    )
+    corrected_at: str = Field(description="更正落库时刻（UTC，ISO 8601，Z 结尾）")
+    receipt: ReceiptOut = Field(
+        description="被作废收据的当前视图：内容/序号/链哈希不变，作废状态见 voided 字段",
+    )
+
+
+class BatchCorrectionResponse(BatchCorrectionOut):
+    already_committed: bool = Field(
+        default=False,
+        description="false 表示本次首次作废；true 表示相同 request_key 重放，回放首次结果",
+    )
 
 
 class ReadingOut(BaseModel):

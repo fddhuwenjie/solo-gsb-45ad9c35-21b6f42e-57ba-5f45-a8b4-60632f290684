@@ -18,12 +18,16 @@ CREATE TABLE IF NOT EXISTS exhibits (
 );
 
 -- 读数以 (exhibit_id, reading_id) 为主键，reading_id 即客户端幂等键
+-- voided_at 非空表示该读数已被上报批次更正作废旧收据链上**只增不改**：
+-- 作废只把读数标记为失效（不删除行），剂量/诊断/读数列表立即排除；
+-- 既有收据的内容、序号与链哈希完全不变。
 CREATE TABLE IF NOT EXISTS readings (
     exhibit_id  TEXT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
     reading_id  TEXT NOT NULL,
     ts          REAL NOT NULL,           -- 采样时刻，Unix 秒（UTC）
     lux         REAL NOT NULL CHECK (lux >= 0),
     received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    voided_at   TEXT,                    -- 作废时刻（UTC ISO 8601）；NULL 表示有效
     PRIMARY KEY (exhibit_id, reading_id)
 );
 
@@ -126,7 +130,36 @@ CREATE TABLE IF NOT EXISTS inventory_rounds (
     result_json    TEXT NOT NULL,          -- InventoryRoundOut 的 JSON（首次固化结果）
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- 照度上报批次更正：作废某张存证收据中实际插入、且仍归属该规范档案的读数。
+-- 本表**只增不改**（无外键、不级联）：更正记录本身即存证，档案归并删除来源
+-- 档案后记录仍须保留，来源旧链查询时仍可标出走废状态。每张收据至多被更正
+-- 一次（(chain_id, seq) 唯一）；request_key 全局唯一，重复 request_key
+-- 重放首次结果，换目标（档案/收据/原因）409。作废与本记录在同一
+-- BEGIN IMMEDIATE 事务内幂等落库。
+CREATE TABLE IF NOT EXISTS reading_corrections (
+    request_key     TEXT PRIMARY KEY,
+    chain_id        TEXT NOT NULL,         -- 被更正收据的链标识
+    seq             INTEGER NOT NULL CHECK (seq >= 1),
+    receipt_id      TEXT NOT NULL,         -- 被更正的收据 ID（request_key 绑定的一部分）
+    canonical_id    TEXT NOT NULL,         -- 更正时解析出的规范档案 ID（用于检测归并状态变化）
+    reason          TEXT NOT NULL,         -- 作废原因（request_key 绑定的一部分）
+    voided_ids_json TEXT NOT NULL,         -- 实际作废的读数 ID 列表（JSON，稳定排序）
+    result_json     TEXT NOT NULL,         -- BatchCorrectionOut（首次结果）的 JSON
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 每张收据至多被成功更正一次：并发/重复更正同一张收据由唯一索引兜底
+CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_receipt_once
+    ON reading_corrections (chain_id, seq);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对既有库做幂等轻量迁移：补 readings.voided_at 列（老版本建表时没有该列）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(readings)").fetchall()}
+    if "voided_at" not in cols:
+        conn.execute("ALTER TABLE readings ADD COLUMN voided_at TEXT")
 
 
 def db_path() -> str:
@@ -147,6 +180,7 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 def get_conn() -> Iterator[sqlite3.Connection]:

@@ -12,6 +12,7 @@ from typing import Literal
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 
+from . import corrections
 from .calendar import (
     CalendarConfig,
     delete_calendar,
@@ -32,6 +33,8 @@ from .receipts import (
     verify_chain_rows,
 )
 from .schemas import (
+    BatchCorrectionRequest,
+    BatchCorrectionResponse,
     CalendarConfigIn,
     CalendarExceptionDayOut,
     CalendarOut,
@@ -61,6 +64,7 @@ from .schemas import (
     ReadingOut,
     ReadingResult,
     ReceiptContentOut,
+    ReceiptCorrectionOut,
     ReceiptListOut,
     ReceiptOut,
     ReconcileRequest,
@@ -92,11 +96,15 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="馆藏展品光照剂量核算 API",
-    version="1.7.0",
+    version="1.8.0",
     description="登记展品光照上限，接收乱序/补传照度读数，按梯形法累计 lux·h，缺测段不插值；"
                 "支持展陈开放日历（IANA 时区 + 每周时段 + 日期例外），剂量可按开放时段裁剪核算；"
                 "支持重复展品档案预演归并，来源 ID 归并后成为目标 ID 的永久别名；"
                 "支持基于完整时间线的照度采集质量诊断（gap / jump / stuck / timestamp_conflict）；"
+                "支持照度上报批次更正：作废指定收据中实际插入且仍归属该档案的读数，"
+                "收据链/归并状态/读数归属变化整次 409，单事务幂等落库、"
+                "重复 request_key 重放原结果，作废读数立即从剂量/诊断/列表排除"
+                "且收据内容与链哈希不变；"
                 "支持 RFID 馆藏盘点对账（固定窗口内按区域保留最高 RSSI、以最后一个有事件窗口"
                 "定位、信号差不足阈值记为位置不明；轮次与规范化请求摘要绑定，重放原结果、"
                 "冲突请求 409、并发只固化一份结果；对账不改读数与收据链）；"
@@ -369,10 +377,13 @@ def list_readings(
     limit: int = Query(default=1000, ge=1, le=100000),
     conn: sqlite3.Connection = Depends(get_conn),
 ) -> ReadingListOut:
-    """按时间顺序列出读数，便于核对与调试；别名自动解析到规范档案。"""
+    """按时间顺序列出读数，便于核对与调试；别名自动解析到规范档案。
+
+    已被批次更正作废的读数立即排除（不出现在列表中）。
+    """
     exhibit = get_canonical_or_404(conn, exhibit_id)
     canonical_id = exhibit["id"]
-    sql = "SELECT * FROM readings WHERE exhibit_id = ?"
+    sql = "SELECT * FROM readings WHERE exhibit_id = ? AND voided_at IS NULL"
     params: list = [canonical_id]
     if start is not None:
         sql += " AND ts >= ?"
@@ -394,10 +405,63 @@ def list_readings(
     )
 
 
+@app.post("/exhibits/{exhibit_id}/readings/correct",
+          response_model=BatchCorrectionResponse, tags=["readings"])
+def correct_reading_batch(
+    exhibit_id: str,
+    payload: BatchCorrectionRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> BatchCorrectionResponse:
+    """照度上报批次更正：作废指定收据中本档案实际插入的读数。
+
+    - 请求 ID 若是已归并档案的别名，自动解析到规范档案；
+    - 服务只作废该收据 outcome 中 ``inserted``、且当前**仍归属该规范档案**
+      （时间/照度与收据内容一致）的读数；
+    - 收据链已变化（断链/内容不符/序号重排）、归并状态已变化（收据属于
+      来源旧链）、读数归属或内容已变化（被搬迁/覆盖/已作废）→ 整次
+      **409**，不产生部分变更，也不留更正记录；
+    - 作废（读数置失效标记）与更正记录在**同一 SQLite 事务**内幂等落库：
+      同一 ``request_key`` 重放返回首次结果（``already_committed=true``），
+      换档案 / 收据 / 原因提交返回 **409**；
+    - 读数行不删除：剂量查询、采集质量诊断与读数列表立即排除作废读数并按
+      剩余时间线重算；被作废收据的内容、序号与链哈希保持不变，查询收据时
+      通过 ``voided`` / ``voided_reading_ids`` / ``correction`` 标出走废状态。
+    """
+    exhibit = get_canonical_or_404(conn, exhibit_id)
+    try:
+        data, replayed = corrections.correct_batch(
+            conn,
+            requested_id=exhibit_id,
+            canonical_id=exhibit["id"],
+            receipt_id=payload.receipt_id,
+            request_key=payload.request_key,
+            reason=payload.reason,
+            receipt_out_builder=lambda row, c: receipt_out(row, c),
+        )
+    except corrections.CorrectionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except corrections.CorrectionEmpty as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return BatchCorrectionResponse(**data, already_committed=replayed)
+
+
 # ---------- 照度上报存证（收据链查询与整链校验） ----------
 
-def receipt_out(row: sqlite3.Row) -> ReceiptOut:
-    return ReceiptOut(
+def _correction_for_receipt(conn: sqlite3.Connection, chain_id: str, seq: int):
+    return conn.execute(
+        "SELECT request_key, canonical_id, reason, voided_ids_json, created_at "
+        "FROM reading_corrections WHERE chain_id = ? AND seq = ?",
+        (chain_id, seq),
+    ).fetchone()
+
+
+def receipt_out(row: sqlite3.Row, conn: sqlite3.Connection | None = None) -> ReceiptOut:
+    """构造收据响应；给定 conn 时附加批次更正（作废）状态。
+
+    作废**不改变**收据内容、序号与哈希（content_hash/chain_hash 照旧），
+    只在收据视图上额外标出 voided / voided_reading_ids / correction。
+    """
+    out = ReceiptOut(
         chain_id=row["chain_id"],
         seq=row["seq"],
         receipt_id=row["receipt_id"],
@@ -407,6 +471,20 @@ def receipt_out(row: sqlite3.Row) -> ReceiptOut:
         created_at=row["created_at"],
         content=ReceiptContentOut(**json.loads(row["payload_json"])),
     )
+    if conn is not None:
+        corr = _correction_for_receipt(conn, row["chain_id"], row["seq"])
+        if corr is not None:
+            voided_ids = json.loads(corr["voided_ids_json"])
+            out.voided = True
+            out.voided_reading_ids = voided_ids
+            out.correction = ReceiptCorrectionOut(
+                request_key=corr["request_key"],
+                canonical_id=corr["canonical_id"],
+                reason=corr["reason"],
+                voided_reading_ids=voided_ids,
+                created_at=corr["created_at"],
+            )
+    return out
 
 
 def _chain_verify_out(chain_id: str, verdict: ChainVerification) -> ChainVerifyOut:
@@ -437,7 +515,7 @@ def list_receipts(
         requested_id=exhibit_id,
         canonical_id=canonical_id,
         chain_id=canonical_id,
-        receipts=[receipt_out(r) for r in rows],
+        receipts=[receipt_out(r, conn) for r in rows],
     )
 
 
@@ -470,7 +548,7 @@ def get_receipt(
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"收据不存在: {exhibit_id} 第 {seq} 张")
-    return receipt_out(row)
+    return receipt_out(row, conn)
 
 
 @app.get("/receipts/chains/{chain_id}", response_model=ChainReceiptsOut, tags=["receipts"])
@@ -490,7 +568,8 @@ def list_chain_receipts(
     ).fetchall()
     if not rows:
         raise HTTPException(status_code=404, detail=f"收据链不存在: {chain_id}")
-    return ChainReceiptsOut(chain_id=chain_id, receipts=[receipt_out(r) for r in rows])
+    return ChainReceiptsOut(chain_id=chain_id,
+                            receipts=[receipt_out(r, conn) for r in rows])
 
 
 @app.get("/receipts/chains/{chain_id}/verify", response_model=ChainVerifyOut, tags=["receipts"])
@@ -538,9 +617,11 @@ def diagnose_readings(
     if end_s <= start_s:
         raise HTTPException(status_code=422, detail="end 必须晚于 start")
 
-    # 完整时间线：诊断事件必须在全部已存读数上形成，不能只取窗口内数据
+    # 完整时间线：诊断事件必须在全部已存读数上形成，不能只取窗口内数据。
+    # 已被批次更正作废的读数立即排除，事件基于剩余时间线重算。
     rows = conn.execute(
-        "SELECT reading_id, ts, lux FROM readings WHERE exhibit_id = ? ORDER BY ts, reading_id",
+        "SELECT reading_id, ts, lux FROM readings "
+        "WHERE exhibit_id = ? AND voided_at IS NULL ORDER BY ts, reading_id",
         (canonical_id,),
     ).fetchall()
     events = build_events(
@@ -621,12 +702,15 @@ def query_dose(
     # 1) 截至 end 的全部历史读数——remaining/exceeded/first_exceeded_at 按全历史累计；
     # 2) end 之后最近一条读数——窗口末端可向其线性裁剪。
     # 窗口起点之前的历史读数本身就在 1) 中，窗口起点处同样可线性裁剪。
+    # 已被批次更正作废的读数立即排除：剂量与剩余时间线按剩余读数实时重算。
     all_rows = conn.execute(
-        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts <= ? ORDER BY ts ASC",
+        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts <= ? "
+        "AND voided_at IS NULL ORDER BY ts ASC",
         (canonical_id, end_s),
     ).fetchall()
     after = conn.execute(
-        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts > ? ORDER BY ts ASC LIMIT 1",
+        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts > ? "
+        "AND voided_at IS NULL ORDER BY ts ASC LIMIT 1",
         (canonical_id, end_s),
     ).fetchall()
     readings = [(r["ts"], r["lux"]) for r in all_rows]
